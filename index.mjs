@@ -4,91 +4,75 @@ const client = new BedrockAgentRuntimeClient({ region: process.env.AWS_REGION ||
 
 export const handler = async (event) => {
     try {
-        // 1. Verify Environment Variables
-        const defaultKnowledgeBaseId = process.env.KNOWLEDGE_BASE_ID;
-        const modelArn = process.env.MODEL_ARN?.replace(/["'\s\\]/g, "");
-
-
-        if (!modelArn) {
-            console.error("Missing Environment Variable: MODEL_ARN");
-            return {
-                statusCode: 500,
-                body: JSON.stringify({
-                    error: "Configuration Error",
-                    message: "Lambda environment variable MODEL_ARN is not set."
-                })
-            };
-        }
-
-        // Handle event body
-        let data;
+        // 1. Parse Input Data First
+        let data = event.body ? (typeof event.body === "string" ? JSON.parse(event.body) : event.body) : event;
+        
+        // 2. Extract and Validate Variables
         const query = data.prompt || data.query;
-        const fullPrompt = `You are a helpful Publication expert. Answer thoroughly, with clear structure.
-                            - Include as many relevant details as possible.
-                            - Use bullet points, headings, or numbered steps if suitable.
-                            - If you use knowledge base sources, cite them inline.
-                            Context so far:                            
-                            User question: ${query}`
-        if (event.body) {
-            data = typeof event.body === "string" ? JSON.parse(event.body) : event.body;
-        } else {
-            data = event;
-        }
+        const sessionId = data.sessionId || null;
+        const modelArn = process.env.MODEL_ARN?.replace(/["'\s\\]/g, "");
+        const defaultKnowledgeBaseId = process.env.KNOWLEDGE_BASE_ID;
 
-        
-        let sessionId = data.sessionId;
-        
-        const kbIds = data.knowledgeBaseIds && Array.isArray(data.knowledgeBaseIds) 
-            ? data.knowledgeBaseIds 
-            : [defaultKnowledgeBaseId].filter(Boolean);
-
-        if (!query) {
+        if (!modelArn || !query) {
             return {
                 statusCode: 400,
-                body: JSON.stringify({ error: "Query or prompt is required" })
+                body: JSON.stringify({ error: "Missing required fields: MODEL_ARN or Query" })
             };
         }
 
-        if (kbIds.length === 0) {
+        // Determine KB ID (use provided or default)
+        const targetKbId = (data.knowledgeBaseIds && data.knowledgeBaseIds[0]) || defaultKnowledgeBaseId;
+
+        if (!targetKbId) {
             return {
                 statusCode: 400,
-                body: JSON.stringify({ error: "No Knowledge Base ID provided" })
-            };
-        }
-
-        const targetKbId = kbIds[0];
-
-        // Shared inference configuration from your AWS Console snippet
-        const inferenceConfig = {
-            textInferenceConfig: {
-                temperature: 0,
-                topP: 1,
-                maxTokens: 2048,
-                stopSequences: ["\nObservation"]
+                body: JSON.stringify({ error: "No Knowledge Base ID available." })
             }
-        };
+        }
 
-        // Helper function to create the command input matching your AWS Console config
+        // 3. Define the Command Generator
+        // Note: Using a custom prompt template requires specific placeholders ($search_results$)
         const createCommandInput = (sid) => ({
-            input: { text: fullPrompt },
+            input: { text: query },
+            sessionId: sid,
             retrieveAndGenerateConfiguration: {
+                type: "KNOWLEDGE_BASE",
                 knowledgeBaseConfiguration: {
                     knowledgeBaseId: targetKbId,
-                    modelArn: modelArn, 
-                },
-                type: "KNOWLEDGE_BASE"
+                    modelArn: modelArn,
+                    generationConfiguration: {
+                        promptTemplate: {
+                            textPromptTemplate: `You are a helpful Publication expert. Answer thoroughly, with clear structure.
+                            - Include as many relevant details as possible.
+                            - Use bullet points, headings, or numbered steps if suitable.
+                            - Cite sources from the provided context.
+                            
+                            Context: $search_results$
+                            
+                            User question: $query$`
+                        },
+                        inferenceConfig: {
+                            textInferenceConfig: {
+                                temperature: 0,
+                                topP: 1,
+                                maxTokens: 2048,
+                                stopSequences: ["\nObservation"]
+                            }
+                        }
+                    }
+                }
             }
         });
 
+        // 4. Execution with Session Retry Logic
         let response;
         try {
             const command = new RetrieveAndGenerateCommand(createCommandInput(sessionId));
             response = await client.send(command);
-    
         } catch (error) {
-            // Check if the session ID is invalid/expired
-            if (error.name === "ValidationException" && error.message.toLowerCase().includes("session")) {
-                console.warn(`Session ${sessionId} invalid/expired. Retrying with fresh session.`);
+            // If sessionId is invalid, retry once without it
+            if (sessionId && error.name === "ValidationException") {
+                console.warn("Session invalid, retrying with fresh session...");
                 const retryCommand = new RetrieveAndGenerateCommand(createCommandInput(null));
                 response = await client.send(retryCommand);
             } else {
@@ -98,6 +82,7 @@ export const handler = async (event) => {
 
         return {
             statusCode: 200,
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 generatedText: response.output.text,
                 sessionId: response.sessionId,
@@ -110,10 +95,7 @@ export const handler = async (event) => {
         console.error("Error invoking Bedrock:", error);
         return {
             statusCode: 500,
-            body: JSON.stringify({ 
-                error: "Internal Server Error", 
-                message: error.message 
-            })
+            body: JSON.stringify({ error: error.name, message: error.message })
         };
     }
 };
